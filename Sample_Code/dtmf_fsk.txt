@@ -1,0 +1,116 @@
+#include <math.h>
+#include <stdint.h>
+#include "stm32f4xx_hal.h"
+
+#define SAMPLE_RATE 100000
+#define DTMF_DURATION 40000
+#define DTMF_GAP 40000
+#define BAUD_RATE 1200
+#define F_LO 2200
+#define F_HI 1200
+#define PHASE_BASE (1 << 16)
+
+uint16_t dtmf_low[32], dtmf_high[32], dtmf_buffer[32];
+uint16_t fsk_buffer[32];
+extern DAC_HandleTypeDef hdac;
+extern TIM_HandleTypeDef htim1;
+
+typedef struct {
+    uint32_t omega[2];
+    uint32_t baud_incr;
+    uint32_t phase;
+    uint32_t baud_frac;
+    int current_bit;
+} FSK_mod_state;
+
+void init_dtmf(void) {
+    for (int i = 0; i < 32; i++) {
+        dtmf_low[i] = 2048 + 2047 * sin(2 * M_PI * i / 32);
+        dtmf_high[i] = 2048 + 2047 * sin(2 * M_PI * i / 32);
+    }
+}
+
+void generate_dtmf(uint8_t key, uint16_t *buffer) {
+    uint16_t frequencies[][2] = {
+        {697, 1209}, {697, 1336}, {697, 1477}, {697, 1633},
+        {770, 1209}, {770, 1336}, {770, 1477}, {770, 1633},
+        {852, 1209}, {852, 1336}, {852, 1477}, {852, 1633},
+        {941, 1209}, {941, 1336}, {941, 1477}, {941, 1633}
+    };
+    for (int i = 0; i < 32; i++) {
+        buffer[i] = dtmf_low[i] + dtmf_high[key][i];
+    }
+}
+
+void fsk_mod_init(FSK_mod_state *s) {
+    s->omega[0] = (PHASE_BASE * F_LO) / SAMPLE_RATE;
+    s->omega[1] = (PHASE_BASE * F_HI) / SAMPLE_RATE;
+    s->baud_incr = (BAUD_RATE * 0x10000) / SAMPLE_RATE;
+    s->phase = 0;
+    s->baud_frac = 0;
+    s->current_bit = 0;
+}
+
+void fsk_mod(FSK_mod_state *s, uint16_t *samples, uint32_t nb, int (*get_bit)(void*)) {
+    uint32_t phase = s->phase;
+    uint32_t baud_frac = s->baud_frac;
+    int b = s->current_bit;
+
+    for (uint32_t i = 0; i < nb; i++) {
+        baud_frac += s->baud_incr;
+        if (baud_frac >= 0x10000) {
+            baud_frac -= 0x10000;
+            b = get_bit(NULL);
+        }
+        samples[i] = (uint16_t)(sin(2 * M_PI * phase / PHASE_BASE) * 2047 + 2048);
+        phase += s->omega[b];
+    }
+    s->phase = phase;
+    s->baud_frac = baud_frac;
+    s->current_bit = b;
+}
+
+int get_caller_id_bit(void *data) {
+    static uint8_t caller_id[] = {1, 0, 1, 0, ...}; // Example Caller ID data
+    static uint32_t index = 0;
+    return (index < sizeof(caller_id)) ? caller_id[index++] : 0;
+}
+
+void dial_phone_number(const char *number) {
+    HAL_GPIO_WritePin(DAA_OFFHOOK_GPIO_Port, DAA_OFFHOOK_Pin, GPIO_PIN_RESET); // Go off-hook
+    for (int i = 0; number[i] != '\0'; i++) {
+        generate_dtmf(number[i] - '0', dtmf_buffer);
+        HAL_DAC_Start_DMA(&hdac, DAC_CHANNEL_1, (uint32_t *)dtmf_buffer, 32, DAC_ALIGN_12B_R);
+        HAL_Delay(DTMF_DURATION / 1000);
+        HAL_DAC_Stop(&hdac, DAC_CHANNEL_1);
+        HAL_Delay(DTMF_GAP / 1000);
+    }
+    HAL_GPIO_WritePin(DAA_OFFHOOK_GPIO_Port, DAA_OFFHOOK_Pin, GPIO_PIN_SET); // Go on-hook
+}
+
+void send_caller_id(void) {
+    FSK_mod_state fsk_state;
+    fsk_mod_init(&fsk_state);
+    HAL_DAC_Start_DMA(&hdac, DAC_CHANNEL_1, (uint32_t *)fsk_buffer, 32, DAC_ALIGN_12B_R);
+    fsk_mod(&fsk_state, fsk_buffer, 32, get_caller_id_bit);
+    HAL_DAC_Stop(&hdac, DAC_CHANNEL_1);
+}
+
+int main(void) {
+    HAL_Init();
+    SystemClock_Config(); // Configure to 168 MHz
+    MX_DAC_Init();
+    MX_DMA_Init();
+    MX_TIM1_Init();
+    init_dtmf();
+    HAL_DAC_Start(&hdac, DAC_CHANNEL_1);
+    HAL_TIM_Base_Start(&htim1);
+
+    // Example: Send Caller ID and dial a number
+    send_caller_id();
+    dial_phone_number("1234567890");
+
+    while (1) {
+        // Main loop
+    }
+}
